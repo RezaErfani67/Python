@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from pymongo import MongoClient
+from motor.motor_asyncio import AsyncIOMotorClient
+
 from bson import ObjectId
 import concurrent.futures
 import asyncio
@@ -9,8 +11,12 @@ from bson import json_util
 
 app = FastAPI()
 
-# Replace with your actual MongoDB connection details
+# Using PyMongo
 client = MongoClient("mongodb://localhost:27017/")
+
+#Using Motor
+client = AsyncIOMotorClient("mongodb://localhost:27017/")
+
 db = client["testdb"]
 collection = db["group"]
 
