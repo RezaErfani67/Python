@@ -1,3 +1,16 @@
+#you can send query like this
+# query {
+#   authors{
+#     name
+#     books{
+#       title
+#       author{
+#         name
+#       }
+#     }
+#   }
+# }
+
 from fastapi import FastAPI, HTTPException
 from bson import ObjectId
 import strawberry
@@ -34,17 +47,35 @@ class Query:
     async def books(self) -> List[Book]:
         books = []
         async for document in books_collection.find():
-            books.append(Book(id=str(document['_id']), title=document['title'], author=document['author']))
+            author_id = str(document['author'])
+            author_document = await authors_collection.find_one({'_id': ObjectId(author_id)})
+            author = Author(id=author_id, name=author_document['name'], books=[])
+            books.append(Book(id=str(document['_id']), title=document['title'], author=author))
         return books
 
     @strawberry.field
     async def authors(self) -> List[Author]:
+
+        #simple query
+        # authors = []
+        # async for document in authors_collection.find():
+        #     author_books = []
+        #     async for book_document in books_collection.find({'author': document['_id']}):
+        #         author_books.append(Book(id=str(book_document['_id']), title=book_document['title'], author=document['_id']))
+        #     authors.append(Author(id=str(document['_id']), name=document['name'], books=author_books))
+        # return authors
+
+
+        #complex query
         authors = []
-        async for document in authors_collection.find():
-            author_books = []
-            async for book_document in books_collection.find({'author': document['_id']}):
-                author_books.append(Book(id=str(book_document['_id']), title=book_document['title'], author=document['_id']))
-            authors.append(Author(id=str(document['_id']), name=document['name'], books=author_books))
+        async for author_document in authors_collection.find():
+            books = []
+            async for book_document in books_collection.find({'author': author_document['_id']}):
+                author = Author(id=str(author_document['_id']),name=author_document['name'], books=[])
+                book = Book(id=str(book_document['_id']),title=book_document['title'], author=author)
+                books.append(book)
+            author = Author(id=str(author_document['_id']),name=author_document['name'], books=books)
+            authors.append(author)
         return authors
 
 # Define your mutations
@@ -98,3 +129,5 @@ app.mount("/graphql", graphql_app)
 if __name__ == "__main__":
     import uvicorn 
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True ,workers=4)
+
+
