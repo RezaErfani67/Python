@@ -1,909 +1,585 @@
 import asyncio
-from typing import Optional, List, Dict, Any
-from dataclasses import dataclass
-from datetime import datetime
-import time
-
+from typing import Optional, List, Dict, Any, cast
+from dataclasses import dataclass, field, replace
 import flet as ft
 
 from sqlmodel import SQLModel, Field, Relationship, select
-from sqlalchemy import Column, DateTime, text
-from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.asyncio import (
-    AsyncSession,
-    create_async_engine,
-    async_sessionmaker,
-)
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import selectinload
+from sqlalchemy import func
 
-# =====================================================
-# DATABASE
-# =====================================================
+# 1. Observable Store
+@dataclass
+@ft.observable
+class PostStore:
+    posts: List["PostDTO"] = field(default_factory=list)
+    loading: bool = False
+    error: str = ""
+    editing_post_id: Optional[int] = None
+    editing_post_data: Optional["PostDTO"] = None
+    page: int = 1
+    page_size: int = 5
+    total: int = 0
 
-DATABASE_URL = "postgresql+asyncpg://postgres:1@127.0.0.1:5432/automation"
+    async def next_page(self):
+        if self.page * self.page_size < self.total:
+            self.page += 1
+            await self.load_posts()
 
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    pool_pre_ping=True,
-)
+    async def prev_page(self):
+        if self.page > 1:
+            self.page -= 1
+            await self.load_posts()
 
-SessionLocal = async_sessionmaker(
-    engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-)
+    async def load_posts(self):
+        self.loading = True
+        self.error = ""
+        try:
+            result = await get_posts_page(self.page, self.page_size)
 
-# =====================================================
-# MODELS
-# =====================================================
+            self.total = result["total"]
+
+            self.posts = [
+                PostDTO(
+                    id=p.id,
+                    title=p.title,
+                    content=p.content,
+                    user_id=p.user_id,
+                    comments=[
+                        CommentDTO(id=c.id, content=c.content)
+                        for c in p.comments
+                    ],
+                )
+                for p in result["items"]
+            ]
+
+        except Exception as e:
+            self.error = f"Error loading posts: {e}"
+        finally:
+            self.loading = False
+
+
+    
+    def start_editing(self, post_id: int):
+        self.editing_post_id = post_id
+        for post in self.posts:
+            if post.id == post_id:
+                self.editing_post_data = replace(post)
+                break
+    
+    def update_editing_post(self, title: str, content: str):
+        if self.editing_post_data:
+            self.editing_post_data.title = title
+            self.editing_post_data.content = content
+    
+    async def save_editing_post(self) -> bool:
+        if not self.editing_post_data or not self.editing_post_id:
+            return False
+        
+        try:
+            updated_post = await update_post(
+                self.editing_post_id,
+                self.editing_post_data.title,
+                self.editing_post_data.content
+            )
+            
+            if updated_post:
+                for i, post in enumerate(self.posts):
+                    if post.id == self.editing_post_id:
+                        self.posts[i] = updated_post
+                        break
+                
+                self.editing_post_id = None
+                self.editing_post_data = None
+                return True
+        
+        except Exception as e:
+            self.error = f"Error saving post: {e}"
+        
+        return False
+    
+    def cancel_editing(self):
+        self.editing_post_id = None
+        self.editing_post_data = None
+
+
+@dataclass
+@ft.observable
+class PostDTO:
+    id: Optional[int] = None
+    title: str = ""
+    content: str = ""
+    user_id: int = 0
+    comments: List["CommentDTO"] = field(default_factory=list)
+
+
+@dataclass
+@ft.observable
+class CommentDTO:
+    id: int
+    content: str
+
+
+# 2. Create global store instance
+post_store = PostStore()
+
 
 class User(SQLModel, table=True):
     __tablename__ = "users"
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    username: str = Field(index=True, unique=True)
-
-    interests: List[dict] = Field(
-        default_factory=list,
-        sa_column=Column(JSONB, nullable=False, server_default="[]"),
-    )
-
+    id: int = Field(default=None, primary_key=True)
+    username: str = Field(default="", unique=True)
     posts: List["Post"] = Relationship(back_populates="user")
 
 
 class Post(SQLModel, table=True):
     __tablename__ = "posts"
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    title: str = Field(max_length=200)
-    content: str
-    created_at: Optional[datetime] = Field(
-        default_factory=datetime.utcnow,
-        sa_column=Column(DateTime(timezone=True))
-    )
+    id: int = Field(default=None, primary_key=True)
+    title: str = Field()
     user_id: int = Field(foreign_key="users.id")
+    content: str = Field()
     user: Optional[User] = Relationship(back_populates="posts")
     comments: List["Comment"] = Relationship(back_populates="post")
 
 
 class Comment(SQLModel, table=True):
     __tablename__ = "comments"
-
-    id: Optional[int] = Field(default=None, primary_key=True)
-    content: str = Field(max_length=500)
-    created_at: Optional[datetime] = Field(
-        default_factory=datetime.utcnow,
-        sa_column=Column(DateTime(timezone=True))
-    )
+    id: int = Field(default=None, primary_key=True)
+    content: str = Field()
     post_id: int = Field(foreign_key="posts.id")
     post: Optional[Post] = Relationship(back_populates="comments")
 
-# =====================================================
-# MIGRATION FUNCTIONS
-# =====================================================
 
-async def check_and_add_columns():
-    """ستون‌های created_at رو به جداول موجود اضافه می‌کنه"""
-    async with engine.begin() as conn:
-        # بررسی وجود ستون created_at در جدول posts
-        result = await conn.execute(
-            text("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'posts' AND column_name = 'created_at'
-            """)
+DATABASE_URL = "postgresql+asyncpg://postgres:1@127.0.0.1:5432/automation"
+engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+SessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+async def get_posts_page(page: int, page_size: int) -> Dict[str, Any]:
+    offset = (page - 1) * page_size
+
+    async with SessionLocal() as session:
+        total = await session.scalar(
+            select(func.count(Post.id))
         )
-        posts_has_column = result.scalar() is not None
-        
-        # بررسی وجود ستون created_at در جدول comments
-        result = await conn.execute(
-            text("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name = 'comments' AND column_name = 'created_at'
-            """)
+
+        result = await session.execute(
+            select(Post)
+            .options(selectinload(Post.user))
+            .options(selectinload(Post.comments))
+            .order_by(Post.id.desc())
+            .limit(page_size)
+            .offset(offset)
         )
-        comments_has_column = result.scalar() is not None
-        
-        # اگر ستون‌ها وجود ندارن، اضافه می‌کنیم
-        if not posts_has_column:
-            print("Adding created_at column to posts table...")
-            await conn.execute(
-                text("ALTER TABLE posts ADD COLUMN created_at TIMESTAMP WITH TIME ZONE")
-            )
-        
-        if not comments_has_column:
-            print("Adding created_at column to comments table...")
-            await conn.execute(
-                text("ALTER TABLE comments ADD COLUMN created_at TIMESTAMP WITH TIME ZONE")
-            )
-        
-        await conn.commit()
-        print("Migration completed successfully!")
-
-
-async def init_db():
-    """ایجاد جداول و اجرای migration"""
-    try:
-        # ابتدا جداول رو ایجاد می‌کنیم
-        async with engine.begin() as conn:
-            await conn.run_sync(SQLModel.metadata.create_all)
-        print("Tables created successfully")
-        
-        # سپس migration رو اجرا می‌کنیم
-        await check_and_add_columns()
-        
-    except Exception as e:
-        print(f"Error in database initialization: {e}")
-        # اگر خطا داد، فقط migration رو اجرا می‌کنیم
-        try:
-            await check_and_add_columns()
-        except Exception as e2:
-            print(f"Migration also failed: {e2}")
-
-# =====================================================
-# SERVICES
-# =====================================================
-
-async def login_user(username: str) -> dict:
-    async with SessionLocal() as s:
-        res = await s.execute(select(User).where(User.username == username))
-        user = res.scalar_one_or_none()
-
-        if not user:
-            user = User(username=username)
-            s.add(user)
-            await s.commit()
-            await s.refresh(user)
 
         return {
-            'id': user.id,
-            'username': user.username
+            "items": result.scalars().unique().all(),
+            "total": total,
         }
 
 
-async def create_post(user_id: int, title: str, content: str) -> dict:
-    async with SessionLocal() as s:
-        try:
-            print(f"Creating post with user_id={user_id}, title={title}")
-            post = Post(title=title, content=content, user_id=user_id)
-            s.add(post)
-            await s.commit()
-            await s.refresh(post)
-            
-            print(f"Post created successfully with id={post.id}")
-            
-            post_dict = {
-                'id': post.id,
-                'title': post.title,
-                'content': post.content,
-                'user_id': post.user_id,
-                'created_at': post.created_at.isoformat() if post.created_at else None,
-                'comments': []
-            }
-            return post_dict
-        except Exception as e:
-            print(f"Error creating post: {e}")
-            return {}
+async def get_all_posts():
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Post)
+            .options(selectinload(Post.user))
+            .options(selectinload(Post.comments))
+        )
+        posts = result.scalars().all()
+        return posts
 
 
-async def create_comment(post_id: int, content: str) -> dict:
+async def get_post_by_id(post_id: int) -> Optional[PostDTO]:
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Post)
+            .where(Post.id == post_id)
+            .options(selectinload(Post.user))
+            .options(selectinload(Post.comments))
+        )
+        post = result.scalars().first()
+
+        if post:
+            return PostDTO(
+                id=post.id,
+                title=post.title,
+                user_id=post.user_id,
+                content=post.content,
+                comments=[CommentDTO(id=c.id, content=c.content) for c in post.comments]
+            )
+        else:
+            print(f"Post with id={post_id} not found.")
+            return None
+
+
+async def update_post(post_id: int, title: str, content: str) -> Optional[PostDTO]:
     async with SessionLocal() as session:
         try:
-            print(f"Creating comment for post_id={post_id}, content={content}")
-            comment = Comment(post_id=post_id, content=content)
-            session.add(comment)
-            await session.commit()
-            await session.refresh(comment)
-            
-            print(f"Comment created successfully with id={comment.id}")
-            
-            comment_dict = {
-                'id': comment.id,
-                'content': comment.content,
-                'post_id': comment.post_id,
-                'created_at': comment.created_at.isoformat() if comment.created_at else None
-            }
-            return comment_dict
-        except Exception as e:
-            print(f"Error creating comment: {e}")
-            return {}
+            result = await session.execute(select(Post).where(Post.id == post_id))
+            post = result.scalars().first()
 
-
-async def load_all_posts_with_comments() -> List[dict]:
-    async with SessionLocal() as s:
-        try:
-            res = await s.execute(
-                select(Post)
-                .options(selectinload(Post.comments))
-                .order_by(Post.id.desc())
-            )
-            posts = res.scalars().all()
-            
-            post_dicts = []
-            for post in posts:
-                comment_dicts = []
-                for comment in post.comments:
-                    comment_dicts.append({
-                        'id': comment.id,
-                        'content': comment.content,
-                        'post_id': comment.post_id,
-                        'created_at': comment.created_at.isoformat() if comment.created_at else None
-                    })
-                
-                post_dicts.append({
-                    'id': post.id,
-                    'title': post.title,
-                    'content': post.content,
-                    'user_id': post.user_id,
-                    'created_at': post.created_at.isoformat() if post.created_at else None,
-                    'comments': comment_dicts
-                })
-            
-            print(f"Loaded {len(post_dicts)} posts")
-            return post_dicts
-        except Exception as e:
-            print(f"Error loading posts: {e}")
-            return []
-
-
-async def load_comments_for_post(post_id: int) -> List[dict]:
-    """بارگذاری کامنت‌های یک پست خاص"""
-    async with SessionLocal() as s:
-        try:
-            print(f"Loading comments for post_id={post_id}")
-            # ابتدا پست را با کامنت‌هایش پیدا می‌کنیم
-            res = await s.execute(
-                select(Post)
-                .options(selectinload(Post.comments))
-                .where(Post.id == post_id)
-            )
-            post = res.scalar_one_or_none()
-            
             if not post:
-                print(f"Post {post_id} not found")
-                return []
-            
-            # کامنت‌ها را به فرمت مناسب تبدیل می‌کنیم
-            comment_dicts = []
-            for comment in post.comments:
-                comment_dicts.append({
-                    'id': comment.id,
-                    'content': comment.content,
-                    'post_id': comment.post_id,
-                    'created_at': comment.created_at.isoformat() if comment.created_at else None
-                })
-            
-            print(f"Loaded {len(comment_dicts)} comments for post {post_id}")
-            return comment_dicts
+                print(f"Post with id={post_id} not found for update.")
+                return None
+
+            post.title = title
+            post.content = content
+
+            await session.commit()
+            await session.refresh(post)
+
+            print(f"Post updated successfully with id={post.id}")
+
+            result = await session.execute(
+                select(Post)
+                .where(Post.id == post_id)
+                .options(selectinload(Post.comments))
+            )
+            updated_post = result.scalars().first()
+
+            return PostDTO(
+                id=updated_post.id,
+                title=updated_post.title,
+                user_id=updated_post.user_id,
+                content=updated_post.content,
+                comments=[CommentDTO(id=c.id, content=c.content) for c in updated_post.comments]
+            )
+
         except Exception as e:
-            print(f"Error loading comments for post {post_id}: {e}")
-            return []
+            print(f"Error updating post: {e}")
+            await session.rollback()
+            return None
 
-# =====================================================
-# UI COMPONENTS
-# =====================================================
 
+# 3. کامپوننت برای نمایش کامنت‌ها
 @ft.component
-def Login(on_login):
-    username, set_username = ft.use_state("")
-    error, set_error = ft.use_state("")
-    loading, set_loading = ft.use_state(False)
-
-    async def submit():
-        if not username.strip():
-            set_error("Username required")
-            return
-        
-        set_loading(True)
-        set_error("")
-        try:
-            user = await login_user(username.strip())
-            on_login(user)
-        except Exception as e:
-            set_error(str(e))
-        finally:
-            set_loading(False)
-
-    return ft.Container(
-        width=400,
-        height=300,
-        bgcolor=ft.Colors.WHITE,
-        border_radius=10,
-        padding=20,
-        shadow=ft.BoxShadow(
-            spread_radius=1,
-            blur_radius=15,
-            color=ft.Colors.BLACK12,
-        ),
-        content=ft.Column(
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            spacing=20,
-            controls=[
-                ft.Icon(ft.Icons.PERSON, size=40, color=ft.Colors.BLUE),
-                ft.Text("Welcome to Blog", size=24, weight=ft.FontWeight.BOLD),
-                ft.TextField(
-                    label="Username",
-                    value=username,
-                    autofocus=True,
-                    width=300,
-                    on_submit=lambda e: asyncio.create_task(submit()),
-                    on_change=lambda e: set_username(e.control.value),
-                    filled=True,
-                    border_radius=8,
-                ),
-                ft.ElevatedButton(
-                    "Login / Register",
-                    on_click=lambda e: asyncio.create_task(submit()),
-                    width=300,
-                    height=45,
-                    disabled=loading,
-                ),
-                ft.ProgressRing() if loading else ft.Container(),
-                ft.Text(
-                    error,
-                    color=ft.Colors.RED,
-                    size=12,
-                    visible=bool(error)
-                ),
-            ],
-        ),
-    )
-
-
-@ft.component
-def CommentItem(comment_data: dict):
-    if not isinstance(comment_data, dict):
-        comment_data = {}
-    
-    content = comment_data.get('content', '')
-    created_at = comment_data.get('created_at', '')
-    
-    time_display = ""
-    if created_at:
-        try:
-            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-            time_display = dt.strftime('%H:%M')
-        except:
-            time_display = ""
-    
-    return ft.Container(
-        padding=ft.Padding(left=10, top=8, right=10, bottom=8),
-        bgcolor=ft.Colors.GREY_50,
-        border_radius=8,
-        content=ft.Row(
-            vertical_alignment=ft.CrossAxisAlignment.START,
-            controls=[
-                ft.Icon(ft.Icons.CHAT_BUBBLE_OUTLINE, size=16, color=ft.Colors.BLUE_700),
-                ft.Column(
-                    expand=True,
-                    spacing=2,
-                    controls=[
-                        ft.Text(content, size=14),
-                        ft.Text(
-                            time_display,
-                            size=10,
-                            color=ft.Colors.GREY_500,
-                        ) if time_display else ft.Container(),
-                    ],
-                ),
-            ],
-            spacing=10,
-        ),
-        margin=ft.Margin(bottom=5),
-    )
-
-
-@ft.component
-def CommentSection(post_id: int, initial_comments: List[dict], on_comments_updated):
-    """
-    کامپوننت بخش کامنت‌ها
-    post_id: ID پست مربوطه
-    initial_comments: لیست اولیه کامنت‌ها
-    on_comments_updated: callback برای اطلاع‌رسانی به parent
-    """
-    comment_text, set_comment_text = ft.use_state("")
-    submitting, set_submitting = ft.use_state(False)
-    comments, set_comments = ft.use_state(initial_comments or [])
-    loading_comments, set_loading_comments = ft.use_state(False)
-    
-    # وقتی initial_comments تغییر کند، comments را به‌روز می‌کنیم
-    ft.use_effect(lambda: set_comments(initial_comments or []), [initial_comments])
-    
-    async def handle_add_comment():
-        if not comment_text.strip():
-            return
-        
-        set_submitting(True)
-        try:
-            # کامنت جدید را ایجاد می‌کنیم
-            new_comment = await create_comment(post_id, comment_text.strip())
-            if new_comment and isinstance(new_comment, dict) and 'id' in new_comment:
-                # کامنت جدید را به لیست اضافه می‌کنیم
-                updated_comments = comments + [new_comment]
-                set_comments(updated_comments)
-                set_comment_text("")
-                
-                # به parent اطلاع می‌دهیم که کامنت‌ها به‌روز شده‌اند
-                if on_comments_updated:
-                    await on_comments_updated(updated_comments)
-            else:
-                print(f"Invalid comment data: {new_comment}")
-                    
-        except Exception as e:
-            print(f"Error adding comment: {e}")
-        finally:
-            set_submitting(False)
-    
-    async def refresh_comments():
-        """کامنت‌های این پست خاص را refresh می‌کند"""
-        if loading_comments:
-            return
-        
-        set_loading_comments(True)
-        try:
-            # فقط کامنت‌های این پست را لود می‌کنیم
-            new_comments = await load_comments_for_post(post_id)
-            set_comments(new_comments)
-            
-            # به parent اطلاع می‌دهیم
-            if on_comments_updated:
-                await on_comments_updated(new_comments)
-                
-        except Exception as e:
-            print(f"Error refreshing comments: {e}")
-        finally:
-            set_loading_comments(False)
-    
-    # کامنت‌ها را مرتب می‌کنیم (قدیمی‌ترین اول)
-    sorted_comments = sorted(
-        comments,
-        key=lambda x: x.get('created_at', '') or x.get('id', 0),
-        reverse=False
-    )
-    
-    comments_display = [
-        CommentItem(comment_data=comment)
-        for comment in sorted_comments
-    ]
+def CommentsView(comments: List[CommentDTO]):
+    if not comments:
+        return ft.Text("No comments yet", italic=True, color=ft.Colors.GREY_500)
     
     return ft.Column(
-        spacing=10,
         controls=[
-            ft.Row(
-                controls=[
-                    ft.Icon(ft.Icons.COMMENT, size=18, color=ft.Colors.BLUE),
-                    ft.Text(
-                        f"Comments ({len(comments)})",
-                        size=14,
-                        weight=ft.FontWeight.BOLD,
-                    ),
-                    ft.IconButton(
-                        icon=ft.Icons.REFRESH,
-                        icon_size=16,
-                        tooltip="Refresh comments",
-                        on_click=lambda e: asyncio.create_task(refresh_comments()),
-                        disabled=loading_comments,
-                    ) if not loading_comments else ft.ProgressRing(height=16, width=16),
-                ],
-                spacing=8,
-            ),
-            
+            ft.Text("Comments:", weight=ft.FontWeight.BOLD),
             ft.Column(
-                controls=comments_display,
+                controls=[
+                    ft.Container(
+                        content=ft.Text(f"#{i+1}: {comment.content}"),
+                        padding=ft.Padding.only(left=20, top=5, bottom=5),
+                        border=ft.Border.all(1, ft.Colors.GREY_300),
+                        border_radius=5,
+                        margin=ft.Margin.only(bottom=5),
+                    )
+                    for i, comment in enumerate(comments)
+                ],
                 spacing=5,
-            ) if comments_display else ft.Container(
-                padding=10,
-                content=ft.Column(
-                    horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                    controls=[
-                        ft.Icon(ft.Icons.CHAT_BUBBLE_OUTLINE, size=30, color=ft.Colors.GREY_400),
-                        ft.Text("No comments yet", size=12, color=ft.Colors.GREY),
-                    ],
-                ),
+            )
+        ],
+        spacing=10,
+    )
+
+
+# 4. کامپوننت برای ویرایش پست
+@ft.component
+def EditPost():
+    store_state, _ = ft.use_state(post_store)
+    
+    if not store_state.editing_post_data:
+        return ft.Text("No post selected for editing", italic=True)
+    
+    post = store_state.editing_post_data
+    
+    def update_title(e):
+        store_state.update_editing_post(
+            title=e.control.value,
+            content=post.content
+        )
+    
+    def update_content(e):
+        store_state.update_editing_post(
+            title=post.title,
+            content=e.control.value
+        )
+    
+    return ft.Column(
+        controls=[
+            ft.TextField(
+                label="Title",
+                value=post.title if post else "",
+                on_change=update_title,
+                width=400
             ),
-            
-            ft.Container(
-                padding=ft.Padding(top=10, bottom=5),
-                content=ft.Column(
-                    spacing=8,
-                    controls=[
-                        ft.Row(
-                            controls=[
-                                ft.TextField(
-                                    hint_text="Write a comment...",
-                                    value=comment_text,
-                                    on_change=lambda e: set_comment_text(e.control.value),
-                                    expand=True,
-                                    height=45,
-                                    border_radius=8,
-                                    filled=True,
-                                    disabled=submitting,
-                                    on_submit=lambda e: asyncio.create_task(handle_add_comment()),
-                                ),
-                                ft.IconButton(
-                                    icon=ft.Icons.SEND,
-                                    on_click=lambda e: asyncio.create_task(handle_add_comment()),
-                                    tooltip="Add comment",
-                                    disabled=submitting or not comment_text.strip(),
-                                    style=ft.ButtonStyle(
-                                        shape=ft.RoundedRectangleBorder(radius=8),
-                                        bgcolor=ft.Colors.BLUE if comment_text.strip() else ft.Colors.GREY_300,
-                                        color=ft.Colors.WHITE,
-                                    ),
-                                ),
-                            ],
-                            alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
-                        ),
-                        ft.Row(
-                            controls=[
-                                ft.ProgressRing(height=16, width=16) if submitting else ft.Container(),
-                                ft.Text(
-                                    "Press Enter to submit",
-                                    size=10,
-                                    color=ft.Colors.GREY_500,
-                                    italic=True,
-                                ),
-                            ],
-                            spacing=5,
-                        ),
-                    ],
-                ),
+            ft.TextField(
+                label="Content",
+                value=post.content if post else "",
+                on_change=update_content,
+                multiline=True,
+                min_lines=5,
+                width=400
             ),
         ],
+        spacing=15,
     )
 
 
+# 5. کامپوننت ردیف پست
 @ft.component
-def PostItem(post_data: dict, current_user_id: int, on_post_updated):
-    """
-    کامپوننت نمایش یک پست
-    on_post_updated: callback برای اطلاع‌رسانی زمانی که کامنت‌های این پست تغییر کند
-    """
-    if not isinstance(post_data, dict):
-        post_data = {}
+def PostRow(post: PostDTO):
+    store_state, _ = ft.use_state(post_store)
+    dlg_edit_ref = ft.use_ref(cast(Optional[ft.AlertDialog], None))
     
-    post_id = post_data.get('id', 0)
-    title = post_data.get('title', 'No Title')
-    content = post_data.get('content', 'No Content')
-    created_at = post_data.get('created_at', '')
-    initial_comments = post_data.get('comments', [])
-    
-    time_display = ""
-    if created_at:
-        try:
-            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-            time_display = dt.strftime('%Y-%m-%d %H:%M')
-        except:
-            time_display = ""
-    else:
-        time_display = "Recent"
-    
-    async def handle_comments_updated(updated_comments):
-        """زمانی که کامنت‌های این پست به‌روز شدند فراخوانی می‌شود"""
-        # به parent اطلاع می‌دهیم که کامنت‌های این پست به‌روز شده‌اند
-        updated_post_data = {**post_data, 'comments': updated_comments}
-        if on_post_updated:
-            await on_post_updated(post_id, updated_post_data)
-    
-    return ft.Container(
-        padding=20,
-        bgcolor=ft.Colors.WHITE,
-        border_radius=12,
-        shadow=ft.BoxShadow(
-            spread_radius=1,
-            blur_radius=10,
-            color=ft.Colors.GREY_300,
-        ),
-        content=ft.Column(
-            spacing=15,
-            controls=[
-                ft.Column(
-                    spacing=5,
-                    controls=[
-                        ft.Row(
-                            controls=[
-                                ft.Text(title, size=20, weight=ft.FontWeight.BOLD, expand=True),
-                                ft.Icon(ft.Icons.PERSON_OUTLINE, size=18, color=ft.Colors.GREY),
-                            ],
-                        ),
-                        ft.Text(
-                            time_display,
-                            size=12,
-                            color=ft.Colors.GREY_500,
-                        ),
-                    ],
-                ),
-                
-                ft.Container(
-                    padding=ft.Padding(left=5, top=5, bottom=10),
-                    content=ft.Text(content, size=15),
-                ),
-                
-                CommentSection(
-                    post_id=post_id,
-                    initial_comments=initial_comments,
-                    on_comments_updated=handle_comments_updated
-                ),
-                
-                ft.Divider(height=1, color=ft.Colors.GREY_200),
-                
-                ft.Row(
-                    controls=[
-                        ft.IconButton(
-                            icon=ft.Icons.FAVORITE_BORDER,
-                            icon_size=20,
-                            tooltip="Like",
-                        ),
-                        ft.IconButton(
-                            icon=ft.Icons.SHARE,
-                            icon_size=20,
-                            tooltip="Share",
-                        ),
-                    ],
-                    spacing=5,
-                ),
+    # State برای نمایش/مخفی کردن کامنت‌ها
+    show_comments, set_show_comments = ft.use_state(False)
+
+    async def handle_save(e):
+        success = await store_state.save_editing_post()
+        
+        if success:
+            e.page.pop_dialog()
+            success_dialog = ft.AlertDialog(
+                title=ft.Text("Success"),
+                content=ft.Text("Post updated successfully!"),
+                actions=[ft.TextButton("OK", on_click=lambda e: e.page.pop_dialog())]
+            )
+            e.page.show_dialog(success_dialog)
+        else:
+            error_dialog = ft.AlertDialog(
+                title=ft.Text("Error"),
+                content=ft.Text("Failed to update post!"),
+                actions=[ft.TextButton("OK", on_click=lambda e: e.page.pop_dialog())]
+            )
+            e.page.show_dialog(error_dialog)
+
+    def handle_cancel(e):
+        store_state.cancel_editing()
+        e.page.pop_dialog()
+
+    def create_dialog():
+        return ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Edit Post"),
+            content=EditPost(),
+            actions=[
+                ft.TextButton("Save", on_click=handle_save),
+                ft.TextButton("Cancel", on_click=handle_cancel)
             ],
-        ),
-        margin=ft.Margin(bottom=20),
-    )
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
 
+    if dlg_edit_ref.current is None:
+        dlg_edit_ref.current = create_dialog()
 
-@ft.component
-def Blog(user_data: dict):
-    if not isinstance(user_data, dict):
-        user_data = {}
-    
-    user_id = user_data.get('id', 0)
-    username = user_data.get('username', 'Unknown')
-    
-    # اطمینان حاصل کنیم که posts همیشه یک لیست است
-    posts, set_posts = ft.use_state([])
-    title, set_title = ft.use_state("")
-    content, set_content = ft.use_state("")
-    loading, set_loading = ft.use_state(False)
-    creating_post, set_creating_post = ft.use_state(False)
-    
-    async def refresh_all_posts():
-        """بارگذاری تمام پست‌ها (فقط در موارد ضروری)"""
-        if loading:
-            return
+    def open_edit_dialog():
+        store_state.start_editing(post.id)
         
-        set_loading(True)
-        try:
-            all_posts = await load_all_posts_with_comments()
-            # اطمینان حاصل کنیم که all_posts یک لیست است
-            if not isinstance(all_posts, list):
-                print(f"Warning: load_all_posts_with_comments returned {type(all_posts)} instead of list")
-                all_posts = []
-            set_posts(all_posts)
-        except Exception as e:
-            print(f"Error refreshing posts: {e}")
-            set_posts([])  # در صورت خطا لیست خالی قرار می‌دهیم
-        finally:
-            set_loading(False)
-    
-    async def handle_post_updated(post_id: int, updated_post_data: dict):
-        """زمانی که یک پست خاص به‌روز می‌شود"""
-        # فقط پست مورد نظر را در لیست به‌روز می‌کنیم
-        def update_posts_list(prev_posts):
-            # اطمینان حاصل کنیم که prev_posts یک لیست است
-            if not isinstance(prev_posts, list):
-                print(f"Warning: prev_posts is {type(prev_posts)}, converting to list")
-                prev_posts = []
-            
-            updated_posts = []
-            for post in prev_posts:
-                # بررسی کنیم که post یک dictionary است
-                if isinstance(post, dict) and post.get('id') == post_id:
-                    updated_posts.append(updated_post_data)
-                else:
-                    updated_posts.append(post)
-            return updated_posts
-        set_posts(update_posts_list)
-    
-    async def submit_post():
-        title_str = str(title) if title is not None else ""
-        content_str = str(content) if content is not None else ""
+        if dlg_edit_ref.current is None:
+            dlg_edit_ref.current = create_dialog()
         
-        if not title_str.strip() or not content_str.strip():
-            return
-        
-        set_creating_post(True)
-        try:
-            new_post = await create_post(user_id, title_str.strip(), content_str.strip())
-            if new_post and isinstance(new_post, dict) and 'id' in new_post:
-                # پست جدید را به ابتدای لیست اضافه می‌کنیم
-                def add_new_post(prev_posts):
-                    # اطمینان حاصل کنیم که prev_posts یک لیست است
-                    if not isinstance(prev_posts, list):
-                        print(f"Warning: prev_posts is {type(prev_posts)}, converting to list")
-                        prev_posts = []
-                    return [new_post] + prev_posts
-                set_posts(add_new_post)
-                set_title("")
-                set_content("")
-                print(f"Post added successfully: {new_post['title']}")
-            else:
-                print(f"Failed to create post or invalid post data: {new_post}")
-        except Exception as e:
-            print(f"Error creating post: {e}")
-            import traceback
-            traceback.print_exc()  # جزئیات خطا را چاپ می‌کند
-        finally:
-            set_creating_post(False)
+        if dlg_edit_ref.current:
+            ft.context.page.show_dialog(dlg_edit_ref.current)
     
-    def is_form_valid():
-        title_str = str(title) if title is not None else ""
-        content_str = str(content) if content is not None else ""
-        return bool(title_str.strip()) and bool(content_str.strip())
-    
-    # فقط یکبار در ابتدا پست‌ها را لود می‌کنیم
-    ft.use_effect(lambda: asyncio.create_task(refresh_all_posts()), [])
+    def toggle_comments():
+        set_show_comments(not show_comments)
     
     return ft.Column(
-        expand=True,
-        scroll=ft.ScrollMode.AUTO,
         controls=[
-            ft.Container(
-                padding=15,
-                bgcolor=ft.Colors.BLUE,
-                border_radius=10,
-                content=ft.Row(
-                    controls=[
-                        ft.Icon(ft.Icons.RSS_FEED, color=ft.Colors.WHITE),
-                        ft.Text(
-                            f"Welcome, {username}!",
-                            size=22,
-                            color=ft.Colors.WHITE,
-                            weight=ft.FontWeight.BOLD,
-                        ),
-                        ft.IconButton(
-                            icon=ft.Icons.REFRESH,
-                            icon_color=ft.Colors.WHITE,
-                            tooltip="Refresh all posts",
-                            on_click=lambda e: asyncio.create_task(refresh_all_posts()),
-                            disabled=loading,
-                        ),
-                    ],
-                    spacing=15,
-                ),
-                margin=ft.Margin(bottom=20),
-            ),
-            
-            ft.Container(
-                padding=20,
-                bgcolor=ft.Colors.WHITE,
-                border_radius=12,
-                shadow=ft.BoxShadow(
-                    spread_radius=1,
-                    blur_radius=10,
-                    color=ft.Colors.GREY_300,
-                ),
-                content=ft.Column(
-                    spacing=15,
-                    controls=[
-                        ft.Text("Create New Post", size=18, weight=ft.FontWeight.BOLD),
-                        ft.TextField(
-                            label="Title",
-                            value=title,
-                            on_change=lambda e: set_title(e.control.value),
-                            autofocus=True,
-                            border_radius=8,
-                            filled=True,
-                            disabled=creating_post,
-                        ),
-                        ft.TextField(
-                            label="Content",
-                            value=content,
-                            multiline=True,
-                            min_lines=4,
-                            max_lines=8,
-                            on_change=lambda e: set_content(e.control.value),
-                            border_radius=8,
-                            filled=True,
-                            disabled=creating_post,
-                        ),
-                        ft.Row(
-                            controls=[
-                                ft.ElevatedButton(
-                                    "Publish Post",
-                                    on_click=lambda e: asyncio.create_task(submit_post()),
-                                    disabled=creating_post or not is_form_valid(),
-                                    style=ft.ButtonStyle(
-                                        shape=ft.RoundedRectangleBorder(radius=8),
-                                    ),
-                                    icon=ft.Icons.SEND,
-                                ),
-                                ft.ProgressRing() if creating_post else ft.Container(),
-                            ],
-                            spacing=15,
-                        ),
-                    ],
-                ),
-                margin=ft.Margin(bottom=25),
-            ),
-            
-            ft.Column(
+            # ردیف اصلی پست
+            ft.Row(
+                spacing=20,
                 controls=[
-                    ft.Row(
-                        controls=[
-                            ft.Icon(ft.Icons.LIST, color=ft.Colors.BLUE),
-                            ft.Text("Recent Posts", size=18, weight=ft.FontWeight.BOLD),
-                            ft.ProgressRing(height=20, width=20) if loading else ft.Container(),
-                        ],
-                        spacing=10,
-                    ),
-                    
+                    ft.Text(str(post.id), width=50),
                     ft.Column(
                         controls=[
-                            PostItem(
-                                post_data=post,
-                                current_user_id=user_id,
-                                on_post_updated=handle_post_updated
-                            )
-                            for post in posts
+                            ft.Text(post.title, weight=ft.FontWeight.BOLD),
+                            ft.Text(post.content[:100] + "..." if len(post.content) > 100 else post.content, 
+                                   size=12, color=ft.Colors.GREY_600),
                         ],
-                        spacing=10,
-                    ) if posts else ft.Container(
-                        padding=40,
-                        content=ft.Column(
-                            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-                            spacing=15,
-                            controls=[
-                                ft.Icon(ft.Icons.POST_ADD, size=60, color=ft.Colors.GREY_400),
-                                ft.Text("No posts yet", size=16, color=ft.Colors.GREY),
-                                ft.Text(
-                                    "Be the first to share something!",
-                                    size=14,
-                                    color=ft.Colors.GREY_500,
-                                ),
-                            ],
-                        ),
+                        expand=True,
+                    ),
+                    ft.Column(
+                        controls=[
+                            ft.Text(f"Comments: {len(post.comments)}", size=12),
+                            ft.Text(f"User ID: {post.user_id}", size=12),
+                        ],
+                        horizontal_alignment=ft.CrossAxisAlignment.END,
                     ),
                 ],
-                spacing=15,
             ),
+            
+            # دکمه‌های اکشن
+            ft.Row(
+                spacing=10,
+                controls=[
+                    ft.Button(
+                        "Edit Post",
+                        on_click=open_edit_dialog,
+                        icon=ft.Icons.EDIT,
+                    ),
+                    ft.Button(
+                        "Show Comments" if not show_comments else "Hide Comments",
+                        on_click=toggle_comments,
+                        icon=ft.Icons.COMMENT,
+                    ),
+                ],
+            ),
+            
+            # نمایش کامنت‌ها (اگر show_comments True باشد)
+            CommentsView(post.comments) if show_comments else ft.Container(),
+            
+            # خط جداکننده
+            ft.Divider(height=1, color=ft.Colors.GREY_300),
         ],
-        spacing=20,
+        spacing=15,
     )
 
 @ft.component
+def PaginationBar():
+    store, _ = ft.use_state(post_store)
+
+    total_pages = max(1, (store.total + store.page_size - 1) // store.page_size)
+
+    return ft.Row(
+        alignment=ft.MainAxisAlignment.CENTER,
+        spacing=20,
+        controls=[
+            ft.IconButton(
+                icon=ft.Icons.CHEVRON_LEFT,
+                disabled=store.page == 1,
+                on_click=lambda e: asyncio.create_task(store.prev_page()),
+            ),
+            ft.Text(f"Page {store.page} / {total_pages}"),
+            ft.IconButton(
+                icon=ft.Icons.CHEVRON_RIGHT,
+                disabled=store.page == total_pages,
+                on_click=lambda e: asyncio.create_task(store.next_page()),
+            ),
+        ],
+    )
+
+
+# 6. کامپوننت اصلی اپلیکیشن
+@ft.component
 def App():
-    user, set_user = ft.use_state(None)
-
-    if not user:
-        return Login(on_login=set_user)
-
-    return Blog(user)
+    store_state, _ = ft.use_state(post_store)
 
 
-# =====================================================
-# ENTRY POINT
-# =====================================================
 
+    
+    
+    # لود اولیه پست‌ها
+    def effect():
+        async def load():
+            await store_state.load_posts()
+        asyncio.create_task(load())
+    
+    #ft.use_effect(effect, [])
+    ft.use_effect(effect, [store_state.page])
+
+    if store_state.loading:
+        return ft.Column(
+            controls=[
+                ft.ProgressBar(),
+                ft.Text("Loading posts...")
+            ],
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=20,
+        )
+    
+    if store_state.error:
+        return ft.Column(
+            controls=[
+                ft.Text("Error:", weight=ft.FontWeight.BOLD),
+                ft.Text(store_state.error, color=ft.Colors.RED),
+                ft.Button(
+                    "Retry",
+                    on_click=lambda e: asyncio.create_task(store_state.load_posts()),
+                    icon=ft.Icons.REFRESH,
+                )
+            ],
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=20,
+        )
+    
+    return ft.Column(
+        controls=[
+            # هدر
+            ft.Container(
+                content=ft.Row(
+                    controls=[
+                        ft.Text("📝 Blog Posts", size=28, weight=ft.FontWeight.BOLD),
+                        ft.IconButton(
+                            icon=ft.Icons.REFRESH,
+                            on_click=lambda e: asyncio.create_task(store_state.load_posts()),
+                            tooltip="Refresh posts",
+                            icon_size=30,
+                        ),
+                    ],
+                    alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+                ),
+                padding=ft.Padding.only(bottom=20),
+            ),
+            
+            # لیست پست‌ها
+            ft.Container(
+            expand=True,
+            content=ft.ListView(
+                controls=[PostRow(post) for post in store_state.posts],
+                spacing=25,
+                padding=20,
+            ),
+        ),
+
+            PaginationBar(),
+
+            
+            
+            # پاورقی
+            ft.Container(
+                content=ft.Text(
+                    f"Total posts: {len(store_state.posts)} | "
+                    f"Total comments: {sum(len(post.comments) for post in store_state.posts)}",
+                    size=12,
+                    color=ft.Colors.GREY_500,
+                ),
+                padding=ft.Padding.only(top=20),
+                alignment=ft.Alignment.CENTER,
+            ),
+        ],
+        scroll=ft.ScrollMode.AUTO,
+    )
+
+
+# 7. تابع اصلی
 async def main(page: ft.Page):
     page.title = "Blog App"
+    page.window.center()
+    page.vertical_alignment = ft.MainAxisAlignment.START
+    page.horizontal_alignment = ft.CrossAxisAlignment.STRETCH
+    #page.window.maximized = True
+    page.window.maximizable = True
+    page.window.minimizable = True
+    page.window.center()
+    page.window.frameless=False
     page.theme_mode = ft.ThemeMode.LIGHT
-    page.padding = 20
+    page.Padding = 30
     page.scroll = ft.ScrollMode.AUTO
     page.theme = ft.Theme(
         font_family="Vazirmatn, Arial, sans-serif",
         color_scheme_seed=ft.Colors.BLUE,
     )
     
-    # پیام loading
+    # استایل‌های اضافی
+    page.theme.page_transitions.windows = "cupertino"
+    page.theme.page_transitions.macos = "cupertino"
+    page.theme.page_transitions.linux = "cupertino"
+    
     loading_text = ft.Text("Initializing database...")
     page.add(loading_text)
     
     try:
-        await init_db()
         page.clean()
         page.render(App)
     except Exception as e:
         page.clean()
         page.add(ft.Text(f"Database error: {e}", color=ft.Colors.RED))
+
 
 if __name__ == "__main__":
     ft.app(target=main)
